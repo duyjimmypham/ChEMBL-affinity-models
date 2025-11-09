@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+*.pyc
+
+# Large / generated stuff
+data/*
+models/*
+!data/README.md
+
+# OS
+.DS_Store
