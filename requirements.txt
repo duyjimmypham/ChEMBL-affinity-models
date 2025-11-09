@@ -1,0 +1,7 @@
+pandas
+numpy
+scikit-learn
+xgboost
+chembl_webresource_client
+rdkit-pypi
+joblib
