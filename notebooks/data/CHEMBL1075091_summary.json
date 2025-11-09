@@ -1,0 +1,27 @@
+{
+  "rows_total": 642,
+  "unique_molecules": 431,
+  "activity_types": {
+    "EC50": 318,
+    "Activity": 118,
+    "Inhibition": 89,
+    "IC50": 77,
+    "EC90": 28,
+    "Ratio EC50": 5,
+    "Ka": 2,
+    "Kd": 2,
+    "FC": 2,
+    "Emax": 1
+  },
+  "units": {
+    "nM": 400,
+    "%": 208,
+    "uM": 25,
+    "10^4/M": 2
+  },
+  "relations": {
+    "=": 602,
+    ">": 36,
+    "<": 4
+  }
+}

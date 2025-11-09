@@ -1,0 +1,44 @@
+from chembl_webresource_client.new_client import new_client
+import pandas as pd
+import sqlite3
+import os
+
+TARGET_ID = "CHEMBL1075091"
+os.makedirs("data", exist_ok=True)
+
+print("Fetching activities for", TARGET_ID)
+acts = new_client.activity.filter(target_chembl_id=TARGET_ID)
+df = pd.DataFrame(acts)
+print("Total rows pulled:", len(df))
+
+# keep only key columns
+keep_cols = [
+    "molecule_chembl_id",
+    "canonical_smiles",
+    "standard_type",
+    "standard_relation",
+    "standard_value",
+    "standard_units",
+    "assay_description",
+]
+df = df[[c for c in keep_cols if c in df.columns]].copy()
+
+# clean numeric values
+df = df.dropna(subset=["standard_value"])
+df = df[pd.to_numeric(df["standard_value"], errors="coerce").notnull()]
+df["standard_value"] = df["standard_value"].astype(float)
+
+# open SQLite connection
+db_path = "data/chembl1075091.db"
+conn = sqlite3.connect(db_path)
+
+# save as a table
+table_name = "activities"
+df.to_sql(table_name, conn, if_exists="replace", index=False)
+
+# verify
+print("Saved", len(df), "rows to", db_path)
+print("Example schema:")
+print(pd.read_sql(f"PRAGMA table_info({table_name});", conn))
+
+conn.close()
