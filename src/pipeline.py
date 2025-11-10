@@ -457,3 +457,6 @@ def main():
     print("\nBest model:", metrics.get("best_model"))
     print(f"Metrics saved to {metrics_path}")
     print("Done.")
+
+if __name__ == "__main__":
+    main()

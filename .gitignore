@@ -1,13 +1,32 @@
 # Python
 __pycache__/
-.ipynb_checkpoints/
-.venv/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
 
-# Large / generated stuff
-data/*
-models/*
-!data/README.md
+# Local data / results
+data/
+models/
+results/
+!data/.keep
+!models/.keep
+!results/.keep
+
+# Virtual environments
+.env/
+.venv/
+venv/
+ENV/
+
+# IDE / notebooks
+.ipynb_checkpoints/
+.vscode/
+.idea/
 
 # OS
 .DS_Store
+Thumbs.db
+
+# Logs
+*.log
