@@ -100,7 +100,7 @@ PNG files are saved in `results/{target}_plots/` for quick sharing.
 │   ├── score_single.py
 │   ├── score_smiles.py
 │   └── scoring_utils.py
-└── archive/                 # Old demo scripts (fingerprint visualization, tanimoto demo)
+└── examples/                # Sample metrics/plots for two demo targets
 ```
 
 ---
