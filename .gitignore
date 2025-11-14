@@ -12,6 +12,8 @@ results/
 !data/.keep
 !models/.keep
 !results/.keep
+notebooks/data/
+notebooks/*.db
 
 # Virtual environments
 .env/
@@ -30,3 +32,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Snyk Security Extension - AI Rules (auto-generated)
+.github\instructions\snyk_rules.instructions.md

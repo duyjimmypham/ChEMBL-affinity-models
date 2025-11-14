@@ -1,125 +1,138 @@
 #!/usr/bin/env python3
 """
-Generic ChEMBL activity prediction pipeline.
+Train per-target ChEMBL affinity models end-to-end.
 
 Usage:
-    python pipeline.py CHEMBL1075091
-    python pipeline.py CHEMBL203
-
-Behavior:
-- If data/{ID}_activities.db exists, load from there (table: activities)
-- Else, fetch activities from ChEMBL API and save to that DB
-- Apply generic filtering (nM, "=", IC50/EC50/Ki)
-- Label to active/inactive via pIC50 threshold
-- Featurize SMILES → Morgan fingerprints
-- Scaffold split (train/test)
-- Tanimoto overlap check (train vs test)
-- 5-fold CV grid search for 3 model families
-- Evaluate on test
-- Save models to models/, metrics to results/
-
-This is target-agnostic. The JSON from inspect.py was just to *inspect*,
-not to hardcode target-specific rules.
+    python src/pipeline.py CHEMBL203 [--chembl-sqlite path]
 """
 
-import sys
-import os
-import json
-import sqlite3
-import random
-from collections import defaultdict
+from __future__ import annotations
 
+import argparse
+import json
+import logging
+import os
+import random
+import sqlite3
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import joblib
 import numpy as np
 import pandas as pd
-
 from chembl_webresource_client.new_client import new_client
-
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
 from rdkit.Chem.Scaffolds import MurckoScaffold
-
-from sklearn.model_selection import GridSearchCV
-from sklearn.linear_model import LogisticRegression
+from rdkit.DataStructs.cDataStructs import ExplicitBitVect
 from sklearn.ensemble import RandomForestClassifier
-from xgboost import XGBClassifier
-
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    roc_auc_score,
     average_precision_score,
     classification_report,
+    confusion_matrix,
     make_scorer,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
 )
+from sklearn.model_selection import GridSearchCV
 
-import joblib
+from chembl_cache import has_remote_updates, load_target_meta, save_target_meta
+from chembl_client_utils import fetch_paginated
+from local_chembl import fetch_local_activities, find_default_local_db
+
+try:
+    from xgboost import XGBClassifier
+
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
 
 
-# global-ish config (not target-specific)
+LOG_LEVEL = os.getenv("CHEMBL_PIPELINE_LOGLEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+LOGGER = logging.getLogger("chembl_pipeline")
+
+
 RANDOM_STATE = 42
-THRESHOLD_PIC50 = 6.0  # pIC50 >= 6 → active
-ALLOWED_TYPES = {"IC50", "EC50", "Ki"}  # generic, common potency types
-ALLOWED_UNITS = {"nM"}                  # stay consistent
-ALLOWED_REL = {"="}                     # avoid ">" and "<"
+THRESHOLD_ACTIVE_PIC50 = 6.0   # >= 1 µM considered active
+THRESHOLD_INACTIVE_PIC50 = 4.5 # <= 30 µM considered inactive
+ALLOWED_TYPES = {"IC50", "EC50", "Ki"}
+ALLOWED_UNITS = {"nM"}
+ALLOWED_REL = {"="}
 
-os.makedirs("data", exist_ok=True)
-os.makedirs("models", exist_ok=True)
-os.makedirs("results", exist_ok=True)
+DATA_DIR = Path("data")
+MODELS_DIR = Path("models")
+RESULTS_DIR = Path("results")
+
+for path in (DATA_DIR, MODELS_DIR, RESULTS_DIR):
+    path.mkdir(exist_ok=True)
 
 
-# -------------- data loading --------------
-def load_from_sqlite(db_path: str, table: str = "activities") -> pd.DataFrame:
-    conn = sqlite3.connect(db_path)
+# -------------- data io --------------
+def load_from_sqlite(db_path: Path, table: str = "activities") -> pd.DataFrame:
+    conn = sqlite3.connect(str(db_path))
     df = pd.read_sql(f"SELECT * FROM {table}", conn)
     conn.close()
     return df
 
 
-def fetch_from_chembl(target_id: str) -> pd.DataFrame:
-    acts = new_client.activity.filter(target_chembl_id=target_id)
-    df = pd.DataFrame(acts)
-    return df
+def fetch_from_chembl(target_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+    log = logger or LOGGER
+    checkpoint_path = DATA_DIR / f"{target_id}_activities_checkpoint.jsonl"
+    rows = fetch_paginated(
+        new_client.activity,
+        {"target_chembl_id": target_id},
+        checkpoint_path=checkpoint_path,
+        logger=log,
+    )
+    return pd.DataFrame(rows)
 
 
-def save_to_sqlite(df: pd.DataFrame, db_path: str, table: str = "activities"):
-    conn = sqlite3.connect(db_path)
-    df.to_sql(table, conn, if_exists="replace", index=False)
-    conn.close()
+def save_to_sqlite(df: pd.DataFrame, db_path: Path, table: str = "activities") -> None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA synchronous = OFF;")
+        conn.execute("PRAGMA journal_mode = MEMORY;")
+        df.to_sql(table, conn, if_exists="replace", index=False)
+    finally:
+        conn.close()
 
-import json  # you probably already have this at the top
 
-def detect_dominant_activity_type(target_id: str):
+def detect_dominant_activity_type(
+    target_id: str, logger: Optional[logging.Logger] = None
+) -> Optional[str]:
     """
-    Look for data/{target_id}_summary.json (made by inspect_chembl.py),
-    and if it exists, return the most common activity type among IC50/EC50/Ki.
-    If the file doesn't exist or nothing matches, return None.
+    Auto-select the dominant activity type using inspect_chembl summary JSON if present.
     """
-    summary_path = f"data/{target_id}_summary.json"
-    dominant_type = None
-
-    if not os.path.exists(summary_path):
-        # no summary = nothing to auto-select
+    log = logger or LOGGER
+    summary_path = DATA_DIR / f"{target_id}_summary.json"
+    if not summary_path.exists():
         return None
 
-    with open(summary_path, "r") as f:
-        summary = json.load(f)
-
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
     counts = summary.get("activity_types", {})
-    allowed_types = ["IC50", "EC50", "Ki"]
-
     best_type = None
     best_count = 0
-    for t in allowed_types:
-        if t in counts and counts[t] > best_count:
-            best_type = t
-            best_count = counts[t]
+    for activity_type in ("IC50", "EC50", "Ki"):
+        count = counts.get(activity_type, 0)
+        if count > best_count:
+            best_type = activity_type
+            best_count = count
 
     if best_type:
-        print(f"Auto-selected dominant activity type from JSON: {best_type}")
+        log.info("Auto-selected dominant activity type from JSON: %s", best_type)
     return best_type
 
 
-# -------------- cleaning / filtering --------------
+# -------------- preprocessing --------------
 def clean_and_filter(df: pd.DataFrame) -> pd.DataFrame:
-    # keep only columns we care about
     keep_cols = [
         "molecule_chembl_id",
         "canonical_smiles",
@@ -128,17 +141,14 @@ def clean_and_filter(df: pd.DataFrame) -> pd.DataFrame:
         "standard_value",
         "standard_units",
         "assay_description",
+        "updated_on",
     ]
     df = df[[c for c in keep_cols if c in df.columns]].copy()
-
-    # drop missing values
     df = df.dropna(subset=["standard_value", "canonical_smiles"])
 
-    # numeric
     df = df[pd.to_numeric(df["standard_value"], errors="coerce").notnull()].copy()
     df["standard_value"] = df["standard_value"].astype(float)
 
-    # generic filters (NOT target-specific)
     if "standard_units" in df.columns:
         df = df[df["standard_units"].isin(ALLOWED_UNITS)]
     if "standard_relation" in df.columns:
@@ -146,31 +156,127 @@ def clean_and_filter(df: pd.DataFrame) -> pd.DataFrame:
     if "standard_type" in df.columns:
         df = df[df["standard_type"].isin(ALLOWED_TYPES)]
 
-    # drop absurd values
     df = df[(df["standard_value"] > 0) & (df["standard_value"] <= 1e7)]
-
     return df.reset_index(drop=True)
 
 
-def add_labels(df: pd.DataFrame, threshold_pIC50: float = THRESHOLD_PIC50) -> pd.DataFrame:
+def compute_last_updated(df: pd.DataFrame) -> Optional[str]:
+    if "updated_on" not in df.columns:
+        return None
+    series = pd.to_datetime(df["updated_on"], errors="coerce", utc=True)
+    series = series.dropna()
+    if series.empty:
+        return None
+    return series.max().isoformat()
+
+
+def compute_p_activity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Annotate row-level dataframe with p_activity (currently identical to pIC50 for nM data).
+    """
     df = df.copy()
-    # IC50/EC50/Ki are in nM → pIC50 = 9 - log10(nM)
-    df["pIC50"] = 9 - np.log10(df["standard_value"])
-    df["activity"] = (df["pIC50"] >= threshold_pIC50).astype(int)
+    df["p_activity"] = 9 - np.log10(df["standard_value"])
     return df
 
 
-def sanity_check_labels(df: pd.DataFrame):
+def aggregate_per_molecule(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse multiple activity measurements per molecule into a single row using median p_activity.
+    """
+    if "molecule_chembl_id" not in df.columns or "canonical_smiles" not in df.columns:
+        raise RuntimeError("Cannot aggregate without molecule identifiers and SMILES.")
+    grouped = (
+        df.groupby(["molecule_chembl_id", "canonical_smiles"], dropna=False)
+        .agg(
+            p_activity_median=("p_activity", "median"),
+            n_measurements=("p_activity", "count"),
+            p_activity_std=("p_activity", "std"),
+        )
+        .reset_index()
+    )
+    if grouped.empty:
+        raise RuntimeError("No molecules available after aggregation.")
+    grouped.rename(columns={"p_activity_median": "p_activity"}, inplace=True)
+    LOGGER.info("Aggregated to %d unique molecules.", len(grouped))
+    return grouped
+
+
+def add_molecule_level_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Assign activity labels at molecule level using aggregated p_activity values.
+    """
+    df = df.copy()
+
+    def classify(p_activity: float) -> Optional[int]:
+        if p_activity >= THRESHOLD_ACTIVE_PIC50:
+            return 1
+        if p_activity <= THRESHOLD_INACTIVE_PIC50:
+            return 0
+        return None
+
+    df["activity"] = df["p_activity"].apply(classify)
+    before = len(df)
+    df = df[df["activity"].notna()].copy()
+    dropped = before - len(df)
+    if dropped > 0:
+        LOGGER.info(
+            "Dropped %d ambiguous molecules with %.1f < p_activity < %.1f",
+            dropped,
+            THRESHOLD_INACTIVE_PIC50,
+            THRESHOLD_ACTIVE_PIC50,
+        )
+    if df.empty:
+        raise RuntimeError("No molecules remain after applying activity thresholds.")
+    df["activity"] = df["activity"].astype(int)
+    return df
+
+
+def add_quantile_level_labels(
+    df: pd.DataFrame,
+    low_quantile: float = 0.30,
+    high_quantile: float = 0.70,
+    min_per_class: int = 20,
+) -> Tuple[Optional[pd.DataFrame], Dict[str, float]]:
+    """
+    Fallback labeling using within-target quantiles.
+    Returns (labeled_df, {"low": q_low, "high": q_high}).
+    """
+    if df.empty or "p_activity" not in df.columns:
+        return None, {"low": None, "high": None}
+
+    df = df.copy()
+    q_low = float(df["p_activity"].quantile(low_quantile))
+    q_high = float(df["p_activity"].quantile(high_quantile))
+    thresholds = {"low": q_low, "high": q_high}
+
+    if np.isnan(q_low) or np.isnan(q_high) or q_high <= q_low:
+        return None, thresholds
+
+    df["activity"] = np.where(
+        df["p_activity"] >= q_high,
+        1,
+        np.where(df["p_activity"] <= q_low, 0, np.nan),
+    )
+    df = df[df["activity"].notna()].copy()
+    if df.empty:
+        return None, thresholds
+
+    df["activity"] = df["activity"].astype(int)
+    class_counts = df["activity"].value_counts()
+    if len(class_counts) < 2 or (class_counts < min_per_class).any():
+        return None, thresholds
+
+    return df, thresholds
+
+
+def sanity_check_labels(df: pd.DataFrame, logger: Optional[logging.Logger] = None) -> None:
+    log = logger or LOGGER
     vc = df["activity"].value_counts()
-    print("Class counts:\n", vc)
-    if len(vc) < 2:
-        raise SystemExit("Only one class present after filtering; try different filters/threshold.")
+    log.info("Class counts:\n%s", vc)
     if vc.min() < 20:
-        print("WARNING: one class has <20 samples; model may be unstable.")
-    return vc
+        log.warning("One class has <20 samples; model may be unstable.")
 
 
-# -------------- featurization --------------
 def smiles_to_morgan(smiles: str, n_bits: int = 2048, radius: int = 2):
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -181,68 +287,76 @@ def smiles_to_morgan(smiles: str, n_bits: int = 2048, radius: int = 2):
     return arr
 
 
-def featurize(df: pd.DataFrame):
-    X, y, smiles = [], [], []
-    for _, row in df.iterrows():
-        fp = smiles_to_morgan(row["canonical_smiles"])
+def smiles_to_bitvect(smiles: str, n_bits: int = 2048, radius: int = 2):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
+
+
+def featurize(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    fps = []
+    smiles = df["canonical_smiles"].tolist()
+    for smi in smiles:
+        fp = smiles_to_morgan(smi)
         if fp is None:
-            continue
-        X.append(fp)
-        y.append(row["activity"])
-        smiles.append(row["canonical_smiles"])
-    return np.array(X), np.array(y), smiles
+            raise ValueError(f"Could not generate fingerprint for {smi}")
+        fps.append(fp)
+    X = np.vstack(fps)
+    y = df["activity"].values.astype(int)
+    return X, y, smiles
 
 
-# -------------- scaffold split --------------
-def get_scaffold(smi: str):
+def get_scaffold(smi: str) -> Optional[str]:
     mol = Chem.MolFromSmiles(smi)
     if mol is None:
         return None
-    scaf = MurckoScaffold.GetScaffoldForMol(mol)
-    return Chem.MolToSmiles(scaf)
+    scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+    return Chem.MolToSmiles(scaffold) if scaffold else None
 
 
-def scaffold_split_indices(smiles_list, test_size=0.2, random_state=42):
-    from collections import defaultdict
-    scaf_to_idx = defaultdict(list)
-    for i, smi in enumerate(smiles_list):
-        scaf = get_scaffold(smi)
-        if scaf is None:
-            scaf = f"NOSCAF_{i}"
-        scaf_to_idx[scaf].append(i)
+def scaffold_split_indices(
+    smiles_list: Sequence[str], test_size: float = 0.2, random_state: int = RANDOM_STATE
+) -> Tuple[np.ndarray, np.ndarray]:
+    scaffolds = defaultdict(list)
+    for idx, smi in enumerate(smiles_list):
+        scaff = get_scaffold(smi) or f"NO_SCAFFOLD_{idx}"
+        scaffolds[scaff].append(idx)
 
-    rng = random.Random(random_state)
-    scaffolds = list(scaf_to_idx.keys())
-    rng.shuffle(scaffolds)
+    scaffold_items = list(scaffolds.items())
+    random.Random(random_state).shuffle(scaffold_items)
 
-    n_total = len(smiles_list)
-    n_test_target = int(n_total * test_size)
+    train_idx: List[int] = []
+    test_idx: List[int] = []
+    total = len(smiles_list)
+    test_target = int(total * test_size)
 
-    test_idx, train_idx = [], []
-    for scaf in scaffolds:
-        idxs = scaf_to_idx[scaf]
-        if len(test_idx) + len(idxs) <= n_test_target:
-            test_idx.extend(idxs)
+    for scaffold, indices in scaffold_items:
+        if len(test_idx) < test_target:
+            test_idx.extend(indices)
         else:
-            train_idx.extend(idxs)
+            train_idx.extend(indices)
+
+    if not train_idx or not test_idx:
+        raise RuntimeError("Scaffold split failed; adjust test_size or data quality.")
 
     return np.array(train_idx), np.array(test_idx)
 
 
-# -------------- tanimoto check --------------
-def smiles_list_to_fps(smiles_list, radius=2, n_bits=2048):
+def smiles_list_to_fps(smiles_list: Sequence[str], radius: int = 2, n_bits: int = 2048):
     fps = []
     for smi in smiles_list:
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            fps.append(None)
-            continue
-        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
+        fp = smiles_to_bitvect(smi, n_bits=n_bits, radius=radius)
         fps.append(fp)
     return fps
 
 
-def summarize_train_test_tanimoto(train_fps, test_fps, thresholds=(0.6, 0.7, 0.8)):
+from rdkit.DataStructs.cDataStructs import ExplicitBitVect
+def summarize_train_test_tanimoto(
+    train_fps: Sequence[Optional[ExplicitBitVect]],
+    test_fps: Sequence[Optional[ExplicitBitVect]],
+    thresholds: Sequence[float] = (0.6, 0.7, 0.8),
+) -> Tuple[Dict[str, float], np.ndarray]:
     max_sims = []
     for tfp in test_fps:
         if tfp is None:
@@ -253,12 +367,11 @@ def summarize_train_test_tanimoto(train_fps, test_fps, thresholds=(0.6, 0.7, 0.8
             if trfp is None:
                 continue
             sim = DataStructs.TanimotoSimilarity(tfp, trfp)
-            if sim > best:
-                best = sim
+            best = max(best, sim)
         max_sims.append(best)
 
     max_sims = np.array(max_sims)
-    summary = {
+    summary: Dict[str, float] = {
         "mean_max_sim": float(max_sims.mean()),
         "median_max_sim": float(np.median(max_sims)),
     }
@@ -267,11 +380,10 @@ def summarize_train_test_tanimoto(train_fps, test_fps, thresholds=(0.6, 0.7, 0.8
     return summary, max_sims
 
 
-# -------------- model configs --------------
-def get_model_configs():
-    return {
+def get_model_configs(logger: Optional[logging.Logger] = None) -> Dict[str, Dict[str, object]]:
+    configs: Dict[str, Dict[str, object]] = {
         "log_reg": {
-            "model": LogisticRegression(max_iter=1000, n_jobs=-1),
+            "model": LogisticRegression(max_iter=1000, solver="lbfgs"),
             "params": {
                 "C": [0.1, 1.0, 10.0],
                 "class_weight": [None, "balanced"],
@@ -286,7 +398,10 @@ def get_model_configs():
                 "class_weight": ["balanced"],
             },
         },
-        "xgboost": {
+    }
+
+    if XGBOOST_AVAILABLE:
+        configs["xgboost"] = {
             "model": XGBClassifier(
                 objective="binary:logistic",
                 eval_metric="auc",
@@ -301,11 +416,14 @@ def get_model_configs():
                 "subsample": [0.8, 1.0],
                 "colsample_bytree": [0.8, 1.0],
             },
-        },
-    }
+        }
+    else:
+        (logger or LOGGER).warning("XGBoost not available; skipping that model family.")
+
+    return configs
 
 
-def majority_baseline(y_train, y_test):
+def majority_baseline(y_train: np.ndarray, y_test: np.ndarray) -> Dict[str, float]:
     vals, counts = np.unique(y_train, return_counts=True)
     maj = vals[np.argmax(counts)]
     acc = float(np.mean(y_test == maj))
@@ -317,100 +435,255 @@ def majority_baseline(y_train, y_test):
     }
 
 
-# -------------- main --------------
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python pipeline.py CHEMBL_ID")
-        sys.exit(1)
+# -------------- pipeline orchestration --------------
+def run_pipeline(
+    target_id: str,
+    *,
+    force_refresh: bool = False,
+    chembl_sqlite: Optional[str] = None,
+    skip_update_check: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, object]:
+    log = logger or LOGGER
+    target_id = target_id.strip().upper()
+    db_path = DATA_DIR / f"{target_id}_activities.db"
 
-    target_id = sys.argv[1].strip().upper()
-    db_path = f"data/{target_id}_activities.db"
+    dataset_warnings: List[str] = []
+    df_raw: Optional[pd.DataFrame] = None
+    if not chembl_sqlite:
+        auto_db = find_default_local_db()
+        if auto_db:
+            log.info("Detected local ChEMBL SQLite at %s", auto_db)
+            chembl_sqlite = str(auto_db)
 
-    # 1) get data (from local DB if present, else from ChEMBL)
-    if os.path.exists(db_path):
-        print(f"Loading data from {db_path} ...")
-        df_raw = load_from_sqlite(db_path)
-    else:
-        print(f"Fetching data from ChEMBL for {target_id} ...")
-        df_raw = fetch_from_chembl(target_id)
+    local_db_path = Path(chembl_sqlite).expanduser() if chembl_sqlite else None
+
+    if local_db_path:
+        log.info("Loading activities from local ChEMBL SQLite: %s", local_db_path)
+        df_raw = fetch_local_activities(target_id, local_db_path)
         save_to_sqlite(df_raw, db_path)
-        print(f"Saved raw activities to {db_path}")
+        save_target_meta(target_id, compute_last_updated(df_raw), len(df_raw))
+    else:
+        meta = load_target_meta(target_id)
+        cache_exists = db_path.exists()
+        use_cache = cache_exists and not force_refresh
+        needs_refresh = True
 
-    print("Rows fetched:", len(df_raw))
+        if use_cache and (skip_update_check or meta is None):
+            needs_refresh = False
+        elif use_cache and meta is not None:
+            needs_refresh = has_remote_updates(target_id, meta.get("last_updated"), logger=log)
 
-    # 2) see if we have a summary JSON → auto-pick a dominant assay type
-    dominant_type = detect_dominant_activity_type(target_id)
+        if not needs_refresh and cache_exists:
+            log.info("Using cached activities from %s", db_path)
+            df_raw = load_from_sqlite(db_path)
+        else:
+            log.info("Fetching activities from ChEMBL for %s", target_id)
+            df_raw = fetch_from_chembl(target_id, logger=log)
+            save_to_sqlite(df_raw, db_path)
+            save_target_meta(target_id, compute_last_updated(df_raw), len(df_raw))
+            log.info("Saved raw activities to %s", db_path)
 
-    # 3) generic filtering
+    n_raw_rows = len(df_raw)
+    log.info("Rows fetched: %d", n_raw_rows)
+
+    dominant_type = detect_dominant_activity_type(target_id, logger=log)
+
     df = clean_and_filter(df_raw)
-
-    # 4) if we found a dominant type (e.g. EC50), keep only that
     if dominant_type and "standard_type" in df.columns:
         df = df[df["standard_type"] == dominant_type]
 
-    print("Rows after filtering:", len(df))
-
+    n_filtered_rows = len(df)
+    log.info("Rows after filtering: %d", n_filtered_rows)
     if df.empty:
-        raise SystemExit("No rows left after filtering. Try relaxing filters or checking the target.")
+        raise RuntimeError("No rows left after filtering. Check target or adjust filters.")
 
-    # 5) label
-    df = add_labels(df)
-    sanity_check_labels(df)
+    df = compute_p_activity(df)
+    df = aggregate_per_molecule(df)
+    df_mols = df.copy()
+    n_molecules_total = len(df_mols)
+    df = add_molecule_level_labels(df)
+    sanity_check_labels(df, logger=log)
+    labeling_strategy = "absolute"
+    quantile_thresholds = None
+    class_counts_abs = df["activity"].value_counts().to_dict()
+    unique_classes_abs = sorted(class_counts_abs.keys())
 
-    # 6) featurize
-    X, y, smiles = featurize(df)
-    print("Feature matrix:", X.shape)
+    if len(unique_classes_abs) < 2:
+        log.warning(
+            "Only one activity class after absolute thresholds for %s; attempting quantile fallback.",
+            target_id,
+        )
+        df_fallback, quantile_thresholds = add_quantile_level_labels(df_mols)
+        if df_fallback is None:
+            log.error(
+                "Quantile fallback labeling also failed for %s (class_counts=%s).",
+                target_id,
+                class_counts_abs,
+            )
+            metrics = {
+                "target_id": target_id,
+                "trainable": False,
+                "reason": "quantile_failed",
+                "class_counts": class_counts_abs,
+                "labeling_strategy": "quantile_fallback",
+                "quantile_thresholds": quantile_thresholds,
+                "n_raw_rows": n_raw_rows,
+                "n_filtered_rows": n_filtered_rows,
+                "n_molecules_total": n_molecules_total,
+                "n_molecules_labeled": len(df),
+                "pos_rate": None,
+                "dataset_warnings": dataset_warnings,
+            }
+            metrics_path = RESULTS_DIR / f"{target_id}_metrics.json"
+            metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+            log.info("Metrics saved to %s", metrics_path)
+            return {
+                "target_id": target_id,
+                "metrics_path": str(metrics_path),
+                "metrics": metrics,
+                "best_model_path": None,
+            }
 
-    # 7) scaffold split
-    train_idx, test_idx = scaffold_split_indices(
-        smiles, test_size=0.2, random_state=RANDOM_STATE
+        df = df_fallback
+        labeling_strategy = "quantile_fallback"
+        sanity_check_labels(df, logger=log)
+        class_counts = df["activity"].value_counts().to_dict()
+        unique_classes = sorted(class_counts.keys())
+        log.info(
+            "Applied quantile fallback (low=%.2f, high=%.2f). Class counts: %s",
+            quantile_thresholds["low"],
+            quantile_thresholds["high"],
+            class_counts,
+        )
+        if len(unique_classes) < 2:
+            log.error(
+                "Quantile fallback still resulted in a single class for %s.",
+                target_id,
+            )
+            metrics = {
+                "target_id": target_id,
+                "trainable": False,
+                "reason": "quantile_failed",
+                "class_counts": class_counts,
+                "labeling_strategy": labeling_strategy,
+                "quantile_thresholds": quantile_thresholds,
+                "n_raw_rows": n_raw_rows,
+                "n_filtered_rows": n_filtered_rows,
+                "n_molecules_total": n_molecules_total,
+                "n_molecules_labeled": len(df),
+                "pos_rate": None,
+                "dataset_warnings": dataset_warnings,
+            }
+            metrics_path = RESULTS_DIR / f"{target_id}_metrics.json"
+            metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+            log.info("Metrics saved to %s", metrics_path)
+            return {
+                "target_id": target_id,
+                "metrics_path": str(metrics_path),
+                "metrics": metrics,
+                "best_model_path": None,
+            }
+    else:
+        class_counts = class_counts_abs
+
+    n_molecules_labeled = len(df)
+    n_pos = class_counts.get(1, 0)
+    n_neg = class_counts.get(0, 0)
+    total_labeled = n_pos + n_neg
+    pos_rate = (n_pos / total_labeled) if total_labeled > 0 else None
+
+    MIN_MOLECULES = 60
+    MIN_PER_CLASS = 25
+
+    def record_warning(flag: str, message: str):
+        log.warning(message)
+        dataset_warnings.append(flag)
+
+    if n_molecules_labeled < MIN_MOLECULES:
+        record_warning(
+            "too_few_molecules",
+            f"Dataset is very small for target {target_id}: "
+            f"n_molecules_labeled={n_molecules_labeled}. Model may not generalize well.",
+        )
+    if n_pos < MIN_PER_CLASS or n_neg < MIN_PER_CLASS:
+        record_warning(
+            "too_few_per_class",
+            f"One or both classes are very small for target {target_id}: "
+            f"n_pos={n_pos}, n_neg={n_neg} (MIN_PER_CLASS={MIN_PER_CLASS}).",
+        )
+    if pos_rate is not None and (pos_rate < 0.1 or pos_rate > 0.9):
+        record_warning(
+            "extreme_imbalance",
+            f"Extreme class imbalance for target {target_id}: pos_rate={pos_rate:.3f} "
+            f"(n_pos={n_pos}, n_neg={n_neg}).",
+        )
+
+    log.info(
+        "Data summary for %s: molecules_labeled=%d, n_pos=%d, n_neg=%d, pos_rate=%s",
+        target_id,
+        n_molecules_labeled,
+        n_pos,
+        n_neg,
+        f"{pos_rate:.3f}" if pos_rate is not None else "NA",
     )
+
+    X, y, smiles = featurize(df)
+    log.info("Feature matrix shape: %s", X.shape)
+
+    train_idx, test_idx = scaffold_split_indices(smiles, test_size=0.2, random_state=RANDOM_STATE)
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
     train_smiles = [smiles[i] for i in train_idx]
     test_smiles = [smiles[i] for i in test_idx]
+    log.info("Train size: %d | Test size: %d", X_train.shape[0], X_test.shape[0])
 
-    print("Train size:", X_train.shape[0], "Test size:", X_test.shape[0])
-
-    # 8) tanimoto check
     train_fps = smiles_list_to_fps(train_smiles)
     test_fps = smiles_list_to_fps(test_smiles)
     tanimoto_summary, _ = summarize_train_test_tanimoto(train_fps, test_fps)
-    print("\n=== Train–Test Tanimoto Summary ===")
+    log.info("=== Train/Test Tanimoto Summary ===")
     for k, v in tanimoto_summary.items():
-        print(f"{k}: {v:.2f}")
+        log.info("%s: %.2f", k, v)
 
-    # 9) baseline
     baseline = majority_baseline(y_train, y_test)
-    print("\nMajority baseline:", baseline)
+    log.info("Majority baseline: %s", baseline)
 
-    # 10) model training
-    model_configs = get_model_configs()
+    model_configs = get_model_configs(logger=log)
     scorer = make_scorer(roc_auc_score, needs_proba=True)
-    metrics = {
+    metrics: Dict[str, object] = {
         "target_id": target_id,
         "tanimoto_summary": tanimoto_summary,
         "baseline": baseline,
         "models": {},
+        "labeling_strategy": labeling_strategy,
+        "class_counts": class_counts,
+        "n_raw_rows": n_raw_rows,
+        "n_filtered_rows": n_filtered_rows,
+        "n_molecules_total": n_molecules_total,
+        "n_molecules_labeled": n_molecules_labeled,
+        "pos_rate": pos_rate,
+        "dataset_warnings": dataset_warnings,
+        "quantile_thresholds": quantile_thresholds,
     }
+
     best_name = None
     best_auc = -1.0
 
     for name, cfg in model_configs.items():
-        print(f"\n===== Training {name} (5-fold CV) =====")
+        log.info("===== Training %s (5-fold CV) =====", name)
         grid = GridSearchCV(
             estimator=cfg["model"],
             param_grid=cfg["params"],
             scoring=scorer,
             cv=5,
             n_jobs=-1,
-            verbose=1,
+            verbose=0,
         )
         grid.fit(X_train, y_train)
 
         cv_auc = float(grid.best_score_)
-        print("Best CV ROC-AUC:", cv_auc)
-        print("Best params:", grid.best_params_)
+        log.info("%s best CV ROC-AUC: %.3f", name, cv_auc)
+        log.info("%s best params: %s", name, grid.best_params_)
 
         best_est = grid.best_estimator_
         y_proba = best_est.predict_proba(X_test)[:, 1]
@@ -418,13 +691,16 @@ def main():
 
         test_auc = float(roc_auc_score(y_test, y_proba))
         test_pr = float(average_precision_score(y_test, y_proba))
+        report_text = classification_report(y_test, y_pred, digits=3)
+        log.info("%s test ROC-AUC: %.3f | PR-AUC: %.3f", name, test_auc, test_pr)
+        log.info("%s classification report:\n%s", name, report_text)
 
-        print(f"=== {name} on test ===")
-        print("ROC-AUC:", round(test_auc, 3))
-        print("PR-AUC:", round(test_pr, 3))
-        print(classification_report(y_test, y_pred, digits=3))
+        fpr, tpr, _ = roc_curve(y_test, y_proba)
+        precision, recall, _ = precision_recall_curve(y_test, y_proba)
+        cm = confusion_matrix(y_test, y_pred).tolist()
+        report_dict = classification_report(y_test, y_pred, digits=3, output_dict=True)
 
-        model_path = f"models/{target_id}_{name}_best.pkl"
+        model_path = MODELS_DIR / f"{target_id}_{name}_best.pkl"
         joblib.dump(best_est, model_path)
 
         metrics["models"][name] = {
@@ -432,31 +708,78 @@ def main():
             "test_roc_auc": test_auc,
             "test_pr_auc": test_pr,
             "best_params": grid.best_params_,
-            "model_path": model_path,
+            "model_path": str(model_path),
+            "roc_curve": {"fpr": fpr.tolist(), "tpr": tpr.tolist()},
+            "pr_curve": {"precision": precision.tolist(), "recall": recall.tolist()},
+            "confusion_matrix": cm,
+            "classification_report": report_dict,
         }
 
         if test_auc > best_auc:
             best_auc = test_auc
             best_name = name
 
-    # 11) save best model path + metrics
-    if best_name is not None:
+    best_model_path = None
+    if best_name:
         best_model_path = metrics["models"][best_name]["model_path"]
         metrics["best_model"] = {
             "name": best_name,
             "test_roc_auc": best_auc,
             "model_path": best_model_path,
         }
-        with open("results/best_model.txt", "w") as f:
-            f.write(best_model_path)
+        (RESULTS_DIR / "best_model.txt").write_text(best_model_path, encoding="utf-8")
 
-    metrics_path = f"results/{target_id}_metrics.json"
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
+    metrics_path = RESULTS_DIR / f"{target_id}_metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    log.info("Metrics saved to %s", metrics_path)
 
-    print("\nBest model:", metrics.get("best_model"))
-    print(f"Metrics saved to {metrics_path}")
-    print("Done.")
+    return {
+        "target_id": target_id,
+        "metrics_path": str(metrics_path),
+        "metrics": metrics,
+        "best_model_path": best_model_path,
+    }
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train target-specific ChEMBL models.")
+    parser.add_argument("target_id", help="ChEMBL target ID (e.g., CHEMBL1075091)")
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Ignore cached data and refetch activities from ChEMBL.",
+    )
+    parser.add_argument(
+        "--chembl-sqlite",
+        help="Override path to local chembl_<release>.db (auto-detects data/chembl_releases/*).",
+    )
+    parser.add_argument(
+        "--skip-update-check",
+        action="store_true",
+        help="Skip remote timestamp checks before refreshing cached data.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    try:
+        result = run_pipeline(
+            args.target_id,
+            force_refresh=args.force_refresh,
+            chembl_sqlite=args.chembl_sqlite,
+            skip_update_check=args.skip_update_check,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        LOGGER.error("Pipeline failed: %s", exc)
+        sys.exit(1)
+
+    best_model = result["metrics"].get("best_model")
+    if best_model:
+        LOGGER.info("Best model: %s (ROC-AUC=%.3f)", best_model["name"], best_model["test_roc_auc"])
+        LOGGER.info("Best model path: %s", best_model["model_path"])
+    LOGGER.info("Pipeline complete.")
+
 
 if __name__ == "__main__":
     main()

@@ -1,142 +1,125 @@
-# 🧬 ChEMBL-Affinity-Models
+# ChEMBL Affinity Models
 
-A modular cheminformatics + machine learning pipeline for **target-specific bioactivity prediction** using **ChEMBL** data.  
-It automates data retrieval, curation, feature generation, scaffold-aware training, and scoring — fully reproducible from the command line.
-
----
-
-## 🌐 Project Overview
-
-This repository enables:
-
-- Building ML-ready datasets directly from the ChEMBL API  
-- Cleaning, filtering, and labeling biological assays (IC50 / EC50 / Ki / Kd)  
-- Detecting the dominant activity type per target  
-- Featurizing SMILES into Morgan fingerprints  
-- Performing Bemis–Murcko scaffold splits for realistic evaluation  
-- Training Logistic Regression, Random Forest, and optional XGBoost models  
-- Excluding reference ligands (clinical ≥ Phase 2 or mechanism-linked) from training  
-- Scoring single or batch molecules against trained models  
+End-to-end tooling for building target-specific bioactivity classifiers from the [ChEMBL](https://www.ebi.ac.uk/chembl/) knowledge base. The project covers data ingestion, molecule-level curation, scaffold-aware model training, scoring utilities, and simple diagnostics/plots.
 
 ---
 
-## 📦 Repository Structure
+## Features
 
-```
-project_root/
-│
-├── src/
-│   ├── pipeline.py          # Main training entry point
-│   ├── inspect_chembl.py    # Fetches ChEMBL data; builds target datasets
-│   ├── score_single.py      # Score a single SMILES
-│   ├── score_batch.py       # Score multiple SMILES (CSV or DB)
-│
-├── data/
-│   ├── CHEMBLxxxx_activities.db
-│   ├── CHEMBLxxxx_molecules.csv
-│   ├── CHEMBLxxxx_mechanisms.csv
-│   └── CHEMBLxxxx_summary.json
-│
-├── models/                  # Trained models (.joblib)
-│   └── CHEMBLxxxx_random_forest.joblib
-│
-└── results/                 # Metrics & logs
-    ├── CHEMBLxxxx_metrics.json
-    └── best_model.txt
-```
+- **Data acquisition** – `src/inspect_chembl.py` fetches assays/molecules/mechanisms per target, either from the public API (with batching/checkpoints) or from a local SQLite dump.
+- **Molecule-level aggregation** – the training pipeline collapses replicate measurements, applies absolute activity thresholds (with a quantile fallback when necessary), and emits warnings for tiny or imbalanced datasets.
+- **Model training** – `src/pipeline.py` featurizes molecules (RDKit Morgan fingerprints), performs Bemis–Murcko scaffold splits, and tunes Logistic Regression, Random Forest, and optional XGBoost models via cross‑validated grid search.
+- **Scoring utilities** – `src/score_single.py`, `src/score_batch.py`, and `src/score_smiles.py` share a common helper so predictions remain consistent across CLI entrypoints.
+- **Diagnostics** – metrics JSON files include ROC/PR curves, confusion matrices, labeling strategy, dataset warnings, and are easily visualized via `scripts/plot_metrics.py`.
 
 ---
 
-## 🚀 Quick Start
+## Requirements
 
-### 1️⃣ Install dependencies
+- Python **3.11**
+- The Python packages listed in [`requirements.txt`](requirements.txt). Install into a virtual environment:
 
 ```bash
-pip install rdkit-pypi scikit-learn xgboost joblib pandas numpy requests tqdm
+python -m venv .venv
+. .venv/Scripts/activate        # PowerShell: .\.venv\Scripts\Activate.ps1
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
-> XGBoost is optional — the pipeline skips it if missing.
+
+> **RDKit compatibility:** keep NumPy `< 2` and SciPy `< 1.12` (as reflected in `requirements.txt`) so the prebuilt `rdkit-pypi` wheels stay importable.
 
 ---
 
-### 2️⃣ Inspect a target
+## Quick Start
 
-Fetch assays, molecules, and mechanisms for any ChEMBL target:
-
+### 1. (Optional) Download a local ChEMBL dump
+Having the SQLite release locally makes repeated runs much faster and keeps you offline.
 ```bash
-python src/inspect_chembl.py CHEMBL1075091
+python src/chembl_downloader.py --release 36 --output data/chembl_releases --skip-existing
 ```
+`inspect_chembl.py`/`pipeline.py` will auto-detect `data/chembl_releases/chembl_*.db` (or you can pass `--chembl-sqlite path/to/db`).
 
-Creates:
-- `data/CHEMBL1075091_activities.db`  
-- `data/CHEMBL1075091_molecules.csv`  
-- `data/CHEMBL1075091_mechanisms.csv`  
-- `data/CHEMBL1075091_summary.json`
+### 2. Inspect a target
+```bash
+python src/inspect_chembl.py CHEMBL1075091 --fast
+```
+This fetches assays, molecules, and mechanisms; writes `data/{target}_*.db/csv/json`; and caches metadata in `data/meta/`.
 
----
-
-### 3️⃣ Train models
-
+### 3. Train models
 ```bash
 python src/pipeline.py CHEMBL1075091
 ```
+Highlights:
+- Molecule-level aggregation with absolute thresholds (≥6.0 active / ≤4.5 inactive) plus a quantile fallback when only one class remains.
+- Dataset suitability warnings (`too_few_molecules`, `too_few_per_class`, `extreme_imbalance`) logged and recorded in the metrics JSON.
+- Bemis–Murcko scaffold split, 5-fold grid search, ROC/PR curve storage.
+Outputs land in `models/` (pickles) and `results/` (metrics JSON + `best_model.txt` pointer).
 
-Performs:
-- Load / fetch ChEMBL assays  
-- Filter (nM, “=”, IC50/EC50/Ki/Kd)  
-- Label actives (`pActivity ≥ 6.0`)  
-- Exclude phase ≥ 2 or mechanism-linked ligands  
-- Morgan fingerprints (radius 2, 2048 bits)  
-- Scaffold split (80/20) + leakage check  
-- 5-fold CV training (LogReg, RF, XGBoost)  
-- Evaluation on held-out scaffolds  
-- Write metrics + best model path  
+### 4. Score molecules
+Single SMILES:
+```bash
+python src/score_single.py "CCOC(=O)N" --target CHEMBL1075091
+```
+Batch CSV:
+```bash
+python src/score_batch.py --input data/my_smiles.csv --output scored.csv --target-col target_id
+```
+For advanced batching (CSV or SQLite with per-row target IDs) use `src/score_smiles.py`.
+
+### 5. Plot metrics
+```bash
+python scripts/plot_metrics.py CHEMBL1075091 --model log_reg
+```
+PNG files are saved in `results/{target}_plots/` for quick sharing.
+
+> For a more detailed, copy/pasteable workflow (including sanity tips) see [`docs/TESTING.md`](docs/TESTING.md).
 
 ---
 
-### 4️⃣ Score new molecules
+## Repository Layout
 
-#### Single SMILES
-```bash
-python src/score_single.py "CCOc1ccccc1" --target CHEMBL1075091
+```
+.
+├── archive/                 # Retired helper notebooks (kept for reference)
+├── data/
+│   ├── chembl_releases/     # Local ChEMBL SQLite dumps (auto-detected)
+│   ├── meta/                # Per-target metadata (last_updated, row counts)
+│   └── CHEMBLxxxx_*         # Cached activities/molecules/mechanisms
+├── docs/TESTING.md          # Hands-on testing checklist
+├── models/                  # Trained model artifacts (.pkl)
+├── results/                 # Metrics JSON + ROC/PR plots + best_model.txt
+├── scripts/plot_metrics.py  # ROC/PR visualizer
+├── src/
+│   ├── chembl_cache.py      # Cache metadata helpers
+│   ├── chembl_client_utils.py
+│   ├── chembl_downloader.py
+│   ├── inspect_chembl.py
+│   ├── local_chembl.py
+│   ├── pipeline.py
+│   ├── score_batch.py
+│   ├── score_single.py
+│   ├── score_smiles.py
+│   └── scoring_utils.py
+└── archive/                 # Old demo scripts (fingerprint visualization, tanimoto demo)
 ```
 
-#### Batch (CSV or DB)
-```bash
-python src/score_batch.py --input smiles.csv --output scored.csv --target CHEMBL1075091
-```
+---
 
-Expected input column: `smiles` (and optional `target_id`).
+## Dataset Warnings & Labeling
 
-Outputs prediction probabilities and model path used.
+- **Absolute thresholds:** actives are `p_activity ≥ 6.0` (≤1 μM) and inactives are `≤ 4.5` (≥30 μM). Gray-zone molecules are dropped.
+- **Quantile fallback:** if only one class remains, the pipeline automatically labels molecules via within-target quantiles (default 30% vs 70%) and records the chosen thresholds in the metrics file.
+- **Warnings:** Suitability checks append flags to `dataset_warnings` inside each metrics JSON and emit log messages. Inspect these before trusting a model trained on extremely small or imbalanced datasets.
 
 ---
 
-## ⚙️ Pipeline Design
+## Contributing / Next Steps
 
-- **Curation:** keeps numeric nM values with `=` relation  
-- **Featurization:** RDKit Morgan FP (2048 bits, radius 2)  
-- **Scaffold Split:** Bemis–Murcko (80/20)  
-- **Metrics:** CV ROC-AUC + test ROC-AUC by model  
-- **Caching:** reuses activities.db and summary JSON to avoid repeated API calls  
-- **Reference Exclusion:** removes ligands with max_phase ≥ 2 or known mechanisms  
+- File issues or PRs for new model architectures, visualization ideas, or UI integrations.
+- See `docs/TESTING.md` for regression testing ideas before submitting changes.
 
 ---
 
-## 🧱 Reproducibility
+## License
 
-- Deterministic seeds and scaffold splits  
-- Cached datasets for repeatable runs  
-- Models & metrics versioned by target ID  
-
----
-
-## 📚 References
-
-- Bento et al., *Nucleic Acids Res.* 2014 — ChEMBL database  
-- Rogers & Hahn, *J. Chem. Inf. Model.* 2010 — ECFP fingerprints  
-- Bemis & Murcko, *J. Med. Chem.* 1996 — Scaffold frameworks  
-
----
-
-## 🧾 License
-MIT License — free for academic and commercial use.
+MIT License – feel free to use this codebase in academic or commercial settings. See [`LICENSE`](LICENSE) for details.
