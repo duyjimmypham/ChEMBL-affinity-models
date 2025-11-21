@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" alt="ChEMBL Affinity Models Banner" width="300">
+</p>
+
 # ChEMBL Affinity Models
 
 End-to-end tooling for building target-specific bioactivity classifiers from the [ChEMBL](https://www.ebi.ac.uk/chembl/) knowledge base. The project covers data ingestion, molecule-level curation, scaffold-aware model training, scoring utilities, and simple diagnostics/plots.
