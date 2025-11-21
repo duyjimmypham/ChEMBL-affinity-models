@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chembl-affinity-models"
+version = "0.1.0"
+description = "Machine learning pipeline for ChEMBL affinity prediction"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "xgboost",
+    "rdkit",
+    "chembl_webresource_client",
+    "joblib",
+    "matplotlib",
+    "tqdm",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "isort",
+    "mypy",
+    "pylint",
+]

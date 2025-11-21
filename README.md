@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="banner.png" alt="ChEMBL Affinity Models Banner" width="300">
+  <img src="banner.png" alt="ChEMBL Affinity Models Banner" width="80%">
 </p>
 
 # ChEMBL Affinity Models

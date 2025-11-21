@@ -13,7 +13,16 @@ results/
 !models/.keep
 !results/.keep
 notebooks/data/
+notebooks/data/
 notebooks/*.db
+
+# Demo assets
+demo/public/molecule.png
+demo/public/data.json
+
+# Test files
+test_molecules.csv
+test_molecules_scored.csv
 
 # Virtual environments
 .env/

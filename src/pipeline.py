@@ -44,6 +44,25 @@ from chembl_cache import has_remote_updates, load_target_meta, save_target_meta
 from chembl_client_utils import fetch_paginated
 from local_chembl import fetch_local_activities, find_default_local_db
 
+# Import from new modules
+from config import (
+    DATA_DIR,
+    MODELS_DIR,
+    RESULTS_DIR,
+    LOG_LEVEL,
+    RANDOM_STATE,
+    THRESHOLD_ACTIVE_PIC50,
+    THRESHOLD_INACTIVE_PIC50,
+    ALLOWED_TYPES,
+    ALLOWED_UNITS,
+    ALLOWED_REL,
+    MODEL_CONFIGS,
+    XGBOOST_CONFIG,
+    FP_N_BITS,
+    FP_RADIUS,
+)
+from features import smiles_to_morgan, smiles_to_bitvect
+
 try:
     from xgboost import XGBClassifier
 
@@ -52,7 +71,6 @@ except ImportError:
     XGBOOST_AVAILABLE = False
 
 
-LOG_LEVEL = os.getenv("CHEMBL_PIPELINE_LOGLEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
@@ -60,30 +78,35 @@ logging.basicConfig(
 LOGGER = logging.getLogger("chembl_pipeline")
 
 
-RANDOM_STATE = 42
-THRESHOLD_ACTIVE_PIC50 = 6.0   # >= 1 µM considered active
-THRESHOLD_INACTIVE_PIC50 = 4.5 # <= 30 µM considered inactive
-ALLOWED_TYPES = {"IC50", "EC50", "Ki"}
-ALLOWED_UNITS = {"nM"}
-ALLOWED_REL = {"="}
-
-DATA_DIR = Path("data")
-MODELS_DIR = Path("models")
-RESULTS_DIR = Path("results")
-
-for path in (DATA_DIR, MODELS_DIR, RESULTS_DIR):
-    path.mkdir(exist_ok=True)
-
-
 # -------------- data io --------------
 def load_from_sqlite(db_path: Path, table: str = "activities") -> pd.DataFrame:
+    """Loads data from a SQLite table into a DataFrame.
+
+    Args:
+        db_path (Path): Path to the SQLite database.
+        table (str, optional): Table name. Defaults to "activities".
+
+    Returns:
+        pd.DataFrame: The loaded data.
+    """
     conn = sqlite3.connect(str(db_path))
-    df = pd.read_sql(f"SELECT * FROM {table}", conn)
-    conn.close()
+    try:
+        df = pd.read_sql(f"SELECT * FROM {table}", conn)
+    finally:
+        conn.close()
     return df
 
 
 def fetch_from_chembl(target_id: str, logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+    """Fetches activity data for a target from the ChEMBL API.
+
+    Args:
+        target_id (str): The ChEMBL target ID.
+        logger (Optional[logging.Logger]): Logger instance.
+
+    Returns:
+        pd.DataFrame: Raw activity data.
+    """
     log = logger or LOGGER
     checkpoint_path = DATA_DIR / f"{target_id}_activities_checkpoint.jsonl"
     rows = fetch_paginated(
@@ -96,6 +119,13 @@ def fetch_from_chembl(target_id: str, logger: Optional[logging.Logger] = None) -
 
 
 def save_to_sqlite(df: pd.DataFrame, db_path: Path, table: str = "activities") -> None:
+    """Saves a DataFrame to a SQLite database.
+
+    Args:
+        df (pd.DataFrame): Data to save.
+        db_path (Path): Destination database path.
+        table (str, optional): Table name. Defaults to "activities".
+    """
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA synchronous = OFF;")
@@ -133,6 +163,14 @@ def detect_dominant_activity_type(
 
 # -------------- preprocessing --------------
 def clean_and_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Cleans and filters the raw activity DataFrame.
+
+    Args:
+        df (pd.DataFrame): Raw data.
+
+    Returns:
+        pd.DataFrame: Cleaned data with valid SMILES and standard values.
+    """
     keep_cols = [
         "molecule_chembl_id",
         "canonical_smiles",
@@ -161,6 +199,7 @@ def clean_and_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_last_updated(df: pd.DataFrame) -> Optional[str]:
+    """Finds the most recent update timestamp in the data."""
     if "updated_on" not in df.columns:
         return None
     series = pd.to_datetime(df["updated_on"], errors="coerce", utc=True)
@@ -277,28 +316,23 @@ def sanity_check_labels(df: pd.DataFrame, logger: Optional[logging.Logger] = Non
         log.warning("One class has <20 samples; model may be unstable.")
 
 
-def smiles_to_morgan(smiles: str, n_bits: int = 2048, radius: int = 2):
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
-    arr = np.zeros((n_bits,), dtype=int)
-    DataStructs.ConvertToNumpyArray(fp, arr)
-    return arr
-
-
-def smiles_to_bitvect(smiles: str, n_bits: int = 2048, radius: int = 2):
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    return AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
-
-
 def featurize(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Generates features (fingerprints) and labels from the DataFrame.
+
+    Args:
+        df (pd.DataFrame): Labeled molecule data.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, List[str]]: X (features), y (labels), smiles list.
+    """
     fps = []
     smiles = df["canonical_smiles"].tolist()
+    
+    # Note: Could use batch_smiles_to_morgan here, but keeping loop for now
+    # to ensure we catch individual failures if needed, or we can switch to
+    # features.batch_smiles_to_morgan for speed.
     for smi in smiles:
-        fp = smiles_to_morgan(smi)
+        fp = smiles_to_morgan(smi, n_bits=FP_N_BITS, radius=FP_RADIUS)
         if fp is None:
             raise ValueError(f"Could not generate fingerprint for {smi}")
         fps.append(fp)
@@ -318,6 +352,7 @@ def get_scaffold(smi: str) -> Optional[str]:
 def scaffold_split_indices(
     smiles_list: Sequence[str], test_size: float = 0.2, random_state: int = RANDOM_STATE
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Splits data based on Murcko scaffolds to ensure structural diversity in test set."""
     scaffolds = defaultdict(list)
     for idx, smi in enumerate(smiles_list):
         scaff = get_scaffold(smi) or f"NO_SCAFFOLD_{idx}"
@@ -343,7 +378,8 @@ def scaffold_split_indices(
     return np.array(train_idx), np.array(test_idx)
 
 
-def smiles_list_to_fps(smiles_list: Sequence[str], radius: int = 2, n_bits: int = 2048):
+def smiles_list_to_fps(smiles_list: Sequence[str], radius: int = FP_RADIUS, n_bits: int = FP_N_BITS):
+    """Converts a list of SMILES to RDKit ExplicitBitVects."""
     fps = []
     for smi in smiles_list:
         fp = smiles_to_bitvect(smi, n_bits=n_bits, radius=radius)
@@ -351,12 +387,12 @@ def smiles_list_to_fps(smiles_list: Sequence[str], radius: int = 2, n_bits: int 
     return fps
 
 
-from rdkit.DataStructs.cDataStructs import ExplicitBitVect
 def summarize_train_test_tanimoto(
     train_fps: Sequence[Optional[ExplicitBitVect]],
     test_fps: Sequence[Optional[ExplicitBitVect]],
     thresholds: Sequence[float] = (0.6, 0.7, 0.8),
 ) -> Tuple[Dict[str, float], np.ndarray]:
+    """Calculates max similarity of test molecules to the training set."""
     max_sims = []
     for tfp in test_fps:
         if tfp is None:
@@ -381,43 +417,30 @@ def summarize_train_test_tanimoto(
 
 
 def get_model_configs(logger: Optional[logging.Logger] = None) -> Dict[str, Dict[str, object]]:
-    configs: Dict[str, Dict[str, object]] = {
-        "log_reg": {
-            "model": LogisticRegression(max_iter=1000, solver="lbfgs"),
-            "params": {
-                "C": [0.1, 1.0, 10.0],
-                "class_weight": [None, "balanced"],
-            },
-        },
-        "random_forest": {
-            "model": RandomForestClassifier(n_jobs=-1, random_state=RANDOM_STATE),
-            "params": {
-                "n_estimators": [200, 400],
-                "max_depth": [None, 20],
-                "max_features": ["sqrt", 0.3],
-                "class_weight": ["balanced"],
-            },
-        },
+    """Retrieves model configurations from config.py and instantiates objects."""
+    configs = {}
+    
+    # Instantiate models based on config
+    # Logistic Regression
+    lr_cfg = MODEL_CONFIGS["log_reg"]
+    configs["log_reg"] = {
+        "model": LogisticRegression(**lr_cfg["params"]),
+        "params": lr_cfg["param_grid"]
+    }
+    
+    # Random Forest
+    rf_cfg = MODEL_CONFIGS["random_forest"]
+    configs["random_forest"] = {
+        "model": RandomForestClassifier(**rf_cfg["params"]),
+        "params": rf_cfg["param_grid"]
     }
 
-    if XGBOOST_AVAILABLE:
+    if XGBOOST_AVAILABLE and XGBOOST_CONFIG:
         configs["xgboost"] = {
-            "model": XGBClassifier(
-                objective="binary:logistic",
-                eval_metric="auc",
-                tree_method="hist",
-                n_estimators=200,
-                n_jobs=-1,
-                random_state=RANDOM_STATE,
-            ),
-            "params": {
-                "max_depth": [3, 5],
-                "learning_rate": [0.1, 0.05],
-                "subsample": [0.8, 1.0],
-                "colsample_bytree": [0.8, 1.0],
-            },
+            "model": XGBClassifier(**XGBOOST_CONFIG["params"]),
+            "params": XGBOOST_CONFIG["param_grid"]
         }
-    else:
+    elif not XGBOOST_AVAILABLE:
         (logger or LOGGER).warning("XGBoost not available; skipping that model family.")
 
     return configs
@@ -444,6 +467,18 @@ def run_pipeline(
     skip_update_check: bool = False,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, object]:
+    """Executes the full training pipeline for a target.
+
+    Args:
+        target_id (str): ChEMBL target ID.
+        force_refresh (bool): If True, re-download data.
+        chembl_sqlite (str, optional): Path to local ChEMBL DB.
+        skip_update_check (bool): If True, skip checking for remote updates.
+        logger (logging.Logger, optional): Logger instance.
+
+    Returns:
+        Dict[str, object]: Pipeline results including metrics and model paths.
+    """
     log = logger or LOGGER
     target_id = target_id.strip().upper()
     db_path = DATA_DIR / f"{target_id}_activities.db"
@@ -649,7 +684,7 @@ def run_pipeline(
     log.info("Majority baseline: %s", baseline)
 
     model_configs = get_model_configs(logger=log)
-    scorer = make_scorer(roc_auc_score, needs_proba=True)
+    scorer = make_scorer(roc_auc_score, response_method='predict_proba')
     metrics: Dict[str, object] = {
         "target_id": target_id,
         "tanimoto_summary": tanimoto_summary,
@@ -771,7 +806,7 @@ def main() -> None:
             skip_update_check=args.skip_update_check,
         )
     except Exception as exc:  # pylint: disable=broad-except
-        LOGGER.error("Pipeline failed: %s", exc)
+        LOGGER.exception("Pipeline failed: %s", exc)
         sys.exit(1)
 
     best_model = result["metrics"].get("best_model")
