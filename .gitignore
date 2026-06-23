@@ -19,6 +19,8 @@ notebooks/*.db
 # Demo assets
 demo/public/molecule.png
 demo/public/data.json
+demo/node_modules/
+demo/build/
 
 # Test files
 test_molecules.csv
@@ -41,6 +43,3 @@ Thumbs.db
 
 # Logs
 *.log
-
-# Snyk Security Extension - AI Rules (auto-generated)
-.github\instructions\snyk_rules.instructions.md

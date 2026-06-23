@@ -36,9 +36,6 @@ export function MoleculeNode({ delay }: MoleculeNodeProps) {
                 e.currentTarget.nextElementSibling?.classList.remove("hidden");
               }}
             />
-            <div className="hidden text-center absolute inset-0 flex flex-col items-center justify-center">
-              {/* Upload prompt removed */}
-            </div>
           </motion.div>
         </div>
 

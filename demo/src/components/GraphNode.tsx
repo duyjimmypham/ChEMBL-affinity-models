@@ -6,15 +6,15 @@ interface GraphNodeProps {
 }
 
 export function GraphNode({ delay }: GraphNodeProps) {
-  const [picValue, setPicValue] = useState("8.2");
+  const [probability, setProbability] = useState("0.820");
 
   useEffect(() => {
     fetch('/data.json')
       .then(res => res.json())
       .then(data => {
-        if (data.prediction) setPicValue(data.prediction);
+        if (data.prediction) setProbability(data.prediction);
       })
-      .catch(err => console.log("Using default prediction"));
+      .catch(() => console.log("Using default prediction"));
   }, []);
 
   // Data points for the graph
@@ -48,8 +48,8 @@ export function GraphNode({ delay }: GraphNodeProps) {
       <div className="relative bg-white border border-gray-200 rounded-lg p-8 shadow-2xl">
         {/* Label */}
         <div className="mb-6">
-          <h3 className="text-black mb-1">Predicted Affinity (pIC50)</h3>
-          <p className="text-gray-500">Binding affinity score</p>
+          <h3 className="text-black mb-1">Activity Probability</h3>
+          <p className="text-gray-500">Classifier confidence</p>
         </div>
 
         {/* Graph visualization */}
@@ -214,8 +214,8 @@ export function GraphNode({ delay }: GraphNodeProps) {
               <foreignObject x="147" y="22" width="46" height="22">
                 <input
                   type="text"
-                  value={picValue}
-                  onChange={(e) => setPicValue(e.target.value)}
+                  value={probability}
+                  onChange={(e) => setProbability(e.target.value)}
                   className="w-full h-full text-center bg-transparent border-none outline-none text-xs"
                   style={{ font: 'inherit' }}
                 />

@@ -14,7 +14,7 @@ End-to-end tooling for building target-specific bioactivity classifiers from the
 - **Modular featurization** – `src/features.py` provides optimized fingerprint generation with both single-molecule and vectorized batch processing.
 - **Data acquisition** – `src/inspect_chembl.py` fetches assays/molecules/mechanisms per target, either from the public API (with batching/checkpoints) or from a local SQLite dump.
 - **Molecule-level aggregation** – the training pipeline collapses replicate measurements, applies absolute activity thresholds (with a quantile fallback when necessary), and emits warnings for tiny or imbalanced datasets.
-- **Model training** – `src/pipeline.py` featurizes molecules (RDKit Morgan fingerprints), performs Bemis–Murcko scaffold splits, and tunes Logistic Regression, Random Forest, and optional XGBoost models via cross‑validated grid search.
+- **Model training** – `src/pipeline.py` featurizes molecules (RDKit Morgan fingerprints), performs a Bemis–Murcko scaffold holdout, and tunes Logistic Regression, Random Forest, and optional XGBoost models with scaffold-grouped cross-validation.
 - **Optimized batch scoring** – `src/score_batch.py` uses vectorized operations for 10x-100x speedup on large datasets.
 - **Visual demo** – `src/demo.py` generates assets for the React-based portfolio animation in `demo/`.
 - **Diagnostics** – metrics JSON files include ROC/PR curves, confusion matrices, labeling strategy, dataset warnings, and are easily visualized via `scripts/plot_metrics.py`.
@@ -67,7 +67,7 @@ Highlights:
 
 - Molecule-level aggregation with absolute thresholds (≥6.0 active / ≤4.5 inactive) plus a quantile fallback when only one class remains.
 - Dataset suitability warnings (`too_few_molecules`, `too_few_per_class`, `extreme_imbalance`) logged and recorded in the metrics JSON.
-- Bemis–Murcko scaffold split, 5-fold grid search, ROC/PR curve storage.
+- Bemis–Murcko scaffold holdout, scaffold-grouped grid search, ROC/PR curve storage.
   Outputs land in `models/` (pickles) and `results/` (metrics JSON + `best_model.txt` pointer).
 
 ### 4. Score molecules
@@ -128,12 +128,12 @@ PNG files are saved in `results/{target}_plots/` for quick sharing.
 ├── results/                 # Metrics JSON + ROC/PR plots + best_model.txt
 ├── scripts/plot_metrics.py  # ROC/PR visualizer
 ├── src/
-│   ├── config.py            # Centralized configuration (NEW)
-│   ├── features.py          # Fingerprint generation utilities (NEW)
+│   ├── config.py            # Centralized configuration
+│   ├── features.py          # Fingerprint generation utilities
 │   ├── chembl_cache.py      # Cache metadata helpers
 │   ├── chembl_client_utils.py
 │   ├── chembl_downloader.py
-│   ├── demo.py              # React demo asset generator (NEW)
+│   ├── demo.py              # React demo asset generator
 │   ├── inspect_chembl.py
 │   ├── local_chembl.py
 │   ├── pipeline.py          # Main training pipeline
@@ -146,7 +146,7 @@ PNG files are saved in `results/{target}_plots/` for quick sharing.
 
 ---
 
-## Recent Improvements (Phase 1)
+## Implementation Highlights
 
 ### Code Organization
 
@@ -156,7 +156,7 @@ PNG files are saved in `results/{target}_plots/` for quick sharing.
 ### Performance Optimization
 
 - **Vectorized batch scoring**: `score_batch.py` now processes entire datasets at once instead of row-by-row iteration
-- **Expected speedup**: 10x-100x faster for large molecule libraries
+- **Batch scoring**: Fingerprints are generated and scored in aligned arrays rather than through DataFrame row iteration
 
 ### Developer Experience
 

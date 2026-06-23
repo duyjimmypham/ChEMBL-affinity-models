@@ -3,7 +3,7 @@ Feature generation utilities for molecular data.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 from rdkit import Chem, DataStructs
@@ -47,7 +47,11 @@ def smiles_to_bitvect(smi: str, n_bits: int = FP_N_BITS, radius: int = FP_RADIUS
         return None
     return AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
 
-def batch_smiles_to_morgan(smiles_list: Sequence[str], n_bits: int = FP_N_BITS, radius: int = FP_RADIUS) -> np.ndarray:
+def batch_smiles_to_morgan(
+    smiles_list: Sequence[str],
+    n_bits: int = FP_N_BITS,
+    radius: int = FP_RADIUS,
+) -> Tuple[np.ndarray, np.ndarray]:
     """Generates a matrix of Morgan fingerprints for a list of SMILES.
 
     This function is optimized for batch processing.
@@ -58,28 +62,18 @@ def batch_smiles_to_morgan(smiles_list: Sequence[str], n_bits: int = FP_N_BITS, 
         radius (int, optional): Radius. Defaults to config.FP_RADIUS.
 
     Returns:
-        np.ndarray: A matrix of shape (n_valid_molecules, n_bits). 
-                    Invalid SMILES are skipped (or handled by returning rows of zeros/NaNs 
-                    depending on implementation preference - here we will return a matrix 
-                    matching the input length, with NaNs for invalid rows, to maintain alignment).
+        Tuple[np.ndarray, np.ndarray]: A fingerprint matrix aligned with the
+        input and a boolean mask identifying valid SMILES rows. Invalid rows
+        remain zero-filled and must be excluded before prediction.
     """
     n_samples = len(smiles_list)
-    X = np.zeros((n_samples, n_bits), dtype=np.float32) # Use float to allow NaNs if needed, or keep int
-    
-    # Note: For extremely large batches, joblib could be used here.
-    # For now, a simple loop is often fast enough if RDKit is efficient.
-    # If we want to maintain alignment, we need to handle failures.
-    
+    X = np.zeros((n_samples, n_bits), dtype=np.float32)
     valid_mask = np.zeros(n_samples, dtype=bool)
-    
+
     for i, smi in enumerate(smiles_list):
         arr = smiles_to_morgan(smi, n_bits=n_bits, radius=radius)
         if arr is not None:
             X[i, :] = arr
             valid_mask[i] = True
-        else:
-            # Invalid SMILES: leave as zeros or mark? 
-            # For this implementation, we'll leave as zeros but the caller should check validity.
-            pass
-            
+
     return X, valid_mask

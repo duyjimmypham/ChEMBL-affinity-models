@@ -18,8 +18,8 @@ for path in (DATA_DIR, MODELS_DIR, RESULTS_DIR):
 
 # --- Data Processing ---
 RANDOM_STATE = 42
-THRESHOLD_ACTIVE_PIC50 = 6.0   # >= 1 µM considered active
-THRESHOLD_INACTIVE_PIC50 = 4.5 # <= 30 µM considered inactive
+THRESHOLD_ACTIVE_PIC50 = 6.0    # <= 1 µM considered active
+THRESHOLD_INACTIVE_PIC50 = 4.5  # >= ~30 µM considered inactive
 
 ALLOWED_TYPES = {"IC50", "EC50", "Ki"}
 ALLOWED_UNITS = {"nM"}

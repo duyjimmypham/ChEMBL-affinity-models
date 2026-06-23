@@ -66,26 +66,18 @@ def main() -> None:
     
     if global_target:
         print(f"Using global target ID: {global_target}")
-        # Process all as one batch
         process_batch(df, smiles_col, global_target)
     elif args.target_col in df.columns:
         print(f"Using target IDs from column: {args.target_col}")
-        # Group by target_id and process batches
         results = []
         grouped = df.groupby(args.target_col)
         for target_id, group in grouped:
-            # We process the group copy, then append to results
-            # Note: This might reorder rows compared to input.
-            # If order matters, we should assign back to original index.
             sub_df = group.copy()
             process_batch(sub_df, smiles_col, str(target_id))
             results.append(sub_df)
-        
-        # Reassemble
-        df = pd.concat(results)
+
+        df = pd.concat(results).sort_index()
     else:
-        # Fallback: Try to load a default model? Or error?
-        # Let's try to load the "best_model.txt" global default if it exists
         print("No target ID specified. Attempting to use global default model...")
         process_batch(df, smiles_col, None)
 
@@ -109,7 +101,6 @@ def process_batch(df: pd.DataFrame, smiles_col: str, target_id: str | None) -> N
         df["pred_proba"] = np.nan
         return
 
-    # We don't need a complex cache here since we process by group/batch
     model = load_model(str(mp), {})
     
     # 2. Vectorize Fingerprints
@@ -129,25 +120,17 @@ def process_batch(df: pd.DataFrame, smiles_col: str, target_id: str | None) -> N
     if np.any(valid_mask):
         X_valid = X[valid_mask]
         try:
-            # predict_proba returns [n_samples, 2] usually
             probs = model.predict_proba(X_valid)[:, 1]
-            
-            # Assign back. We need to be careful with indexing if df is a slice or filtered.
-            # Since we are modifying the passed df (which is a copy or slice in the main loop),
-            # we can use boolean indexing on the df itself assuming the order matches smiles_list.
-            
-            # Create a temporary array for the full batch
+
             full_probs = np.full(len(df), np.nan)
             full_probs[valid_mask] = probs
-            
+
             df["pred_proba"] = full_probs
             df["model_path_used"] = str(mp)
-            
+
         except Exception as e:
             df["scoring_error"] = f"prediction_failed:{e}"
-    
-    # Mark invalid SMILES
-    # We can use the inverse of valid_mask to set error
+
     invalid_indices = ~valid_mask
     if np.any(invalid_indices):
         df.loc[invalid_indices, "scoring_error"] = "invalid_smiles"

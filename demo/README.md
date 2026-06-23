@@ -1,11 +1,17 @@
 
-  # Animated Machine Learning Flowchart
+# ChEMBL Prediction Demo
 
-  This is a code bundle for Animated Machine Learning Flowchart. The original project is available at https://www.figma.com/design/d9jcRS2SMw65zLhYbHbN7Z/Animated-Machine-Learning-Flowchart.
+Animated visualization of the molecule-scoring workflow used by this project.
 
-  ## Running the code
+## Running the demo
 
-  Run `npm i` to install the dependencies.
+```bash
+npm install
+npm run dev
+```
 
-  Run `npm run dev` to start the development server.
-  
+Create model-specific demo assets from the repository root:
+
+```bash
+python src/demo.py --target CHEMBL203 --smiles "CC(=O)Oc1ccccc1C(=O)O"
+```

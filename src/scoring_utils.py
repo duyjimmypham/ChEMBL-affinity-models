@@ -12,7 +12,6 @@ from typing import Dict, Optional, Tuple
 import joblib
 import numpy as np
 
-# Import from our new modules
 from config import RESULTS_DIR, FP_N_BITS, FP_RADIUS
 from features import smiles_to_morgan
 

@@ -38,13 +38,12 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
 
 from chembl_cache import has_remote_updates, load_target_meta, save_target_meta
 from chembl_client_utils import fetch_paginated
 from local_chembl import fetch_local_activities, find_default_local_db
 
-# Import from new modules
 from config import (
     DATA_DIR,
     MODELS_DIR,
@@ -328,9 +327,6 @@ def featurize(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     fps = []
     smiles = df["canonical_smiles"].tolist()
     
-    # Note: Could use batch_smiles_to_morgan here, but keeping loop for now
-    # to ensure we catch individual failures if needed, or we can switch to
-    # features.batch_smiles_to_morgan for speed.
     for smi in smiles:
         fp = smiles_to_morgan(smi, n_bits=FP_N_BITS, radius=FP_RADIUS)
         if fp is None:
@@ -350,9 +346,40 @@ def get_scaffold(smi: str) -> Optional[str]:
 
 
 def scaffold_split_indices(
-    smiles_list: Sequence[str], test_size: float = 0.2, random_state: int = RANDOM_STATE
+    smiles_list: Sequence[str],
+    y: Optional[np.ndarray] = None,
+    test_size: float = 0.2,
+    random_state: int = RANDOM_STATE,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Splits data based on Murcko scaffolds to ensure structural diversity in test set."""
+    """Split whole Murcko scaffolds into train and test partitions.
+
+    When labels are provided, stratification is attempted while preserving
+    scaffold groups so both partitions remain suitable for classification
+    metrics.
+    """
+    if y is not None:
+        groups = scaffold_groups(smiles_list)
+        labels = np.asarray(y, dtype=int)
+        groups_per_class = [
+            len(np.unique(groups[labels == class_label])) for class_label in (0, 1)
+        ]
+        requested_splits = max(2, round(1 / test_size))
+        n_splits = min(requested_splits, len(np.unique(groups)), *groups_per_class)
+        if n_splits < 2:
+            raise RuntimeError(
+                "A stratified scaffold holdout requires both classes to span "
+                "at least two scaffold groups."
+            )
+        splitter = StratifiedGroupKFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=random_state,
+        )
+        train_idx, test_idx = next(
+            splitter.split(np.zeros(len(smiles_list)), labels, groups)
+        )
+        return np.asarray(train_idx), np.asarray(test_idx)
+
     scaffolds = defaultdict(list)
     for idx, smi in enumerate(smiles_list):
         scaff = get_scaffold(smi) or f"NO_SCAFFOLD_{idx}"
@@ -376,6 +403,46 @@ def scaffold_split_indices(
         raise RuntimeError("Scaffold split failed; adjust test_size or data quality.")
 
     return np.array(train_idx), np.array(test_idx)
+
+
+def scaffold_groups(smiles_list: Sequence[str]) -> np.ndarray:
+    """Return a stable scaffold-group label for each molecule.
+
+    Molecules with the same Bemis–Murcko scaffold receive the same group.
+    Molecules without a scaffold are treated as independent groups.
+    """
+    groups = []
+    for idx, smi in enumerate(smiles_list):
+        groups.append(get_scaffold(smi) or f"NO_SCAFFOLD_{idx}")
+    return np.asarray(groups, dtype=object)
+
+
+def make_scaffold_cv(
+    smiles_list: Sequence[str],
+    y: np.ndarray,
+    max_splits: int = 5,
+) -> Tuple[StratifiedGroupKFold, np.ndarray, int]:
+    """Build group-aware CV so a scaffold never crosses fold boundaries."""
+    groups = scaffold_groups(smiles_list)
+    unique_groups = np.unique(groups)
+    labels = np.asarray(y, dtype=int)
+    groups_per_class = [
+        len(np.unique(groups[labels == class_label])) for class_label in (0, 1)
+    ]
+    n_splits = min(max_splits, len(unique_groups), *groups_per_class)
+
+    if n_splits < 2:
+        raise RuntimeError(
+            "Scaffold-aware cross-validation requires each class to span at "
+            "least two scaffold groups."
+        )
+
+    cv = StratifiedGroupKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+    return cv, groups, n_splits
 
 
 def smiles_list_to_fps(smiles_list: Sequence[str], radius: int = FP_RADIUS, n_bits: int = FP_N_BITS):
@@ -666,12 +733,24 @@ def run_pipeline(
     X, y, smiles = featurize(df)
     log.info("Feature matrix shape: %s", X.shape)
 
-    train_idx, test_idx = scaffold_split_indices(smiles, test_size=0.2, random_state=RANDOM_STATE)
+    train_idx, test_idx = scaffold_split_indices(
+        smiles,
+        y=y,
+        test_size=0.2,
+        random_state=RANDOM_STATE,
+    )
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
     train_smiles = [smiles[i] for i in train_idx]
     test_smiles = [smiles[i] for i in test_idx]
     log.info("Train size: %d | Test size: %d", X_train.shape[0], X_test.shape[0])
+
+    cv, train_scaffold_groups, n_cv_splits = make_scaffold_cv(train_smiles, y_train)
+    log.info(
+        "Using %d-fold stratified scaffold-group cross-validation across %d groups.",
+        n_cv_splits,
+        len(np.unique(train_scaffold_groups)),
+    )
 
     train_fps = smiles_list_to_fps(train_smiles)
     test_fps = smiles_list_to_fps(test_smiles)
@@ -699,22 +778,27 @@ def run_pipeline(
         "pos_rate": pos_rate,
         "dataset_warnings": dataset_warnings,
         "quantile_thresholds": quantile_thresholds,
+        "validation": {
+            "holdout": "bemis_murcko_scaffold_split",
+            "model_selection": "stratified_scaffold_group_cv",
+            "cv_folds": n_cv_splits,
+        },
     }
 
     best_name = None
-    best_auc = -1.0
+    best_cv_auc = -1.0
 
     for name, cfg in model_configs.items():
-        log.info("===== Training %s (5-fold CV) =====", name)
+        log.info("===== Training %s (%d-fold scaffold CV) =====", name, n_cv_splits)
         grid = GridSearchCV(
             estimator=cfg["model"],
             param_grid=cfg["params"],
             scoring=scorer,
-            cv=5,
+            cv=cv,
             n_jobs=-1,
             verbose=0,
         )
-        grid.fit(X_train, y_train)
+        grid.fit(X_train, y_train, groups=train_scaffold_groups)
 
         cv_auc = float(grid.best_score_)
         log.info("%s best CV ROC-AUC: %.3f", name, cv_auc)
@@ -750,8 +834,8 @@ def run_pipeline(
             "classification_report": report_dict,
         }
 
-        if test_auc > best_auc:
-            best_auc = test_auc
+        if cv_auc > best_cv_auc:
+            best_cv_auc = cv_auc
             best_name = name
 
     best_model_path = None
@@ -759,7 +843,9 @@ def run_pipeline(
         best_model_path = metrics["models"][best_name]["model_path"]
         metrics["best_model"] = {
             "name": best_name,
-            "test_roc_auc": best_auc,
+            "selection_metric": "cv_roc_auc",
+            "cv_roc_auc": best_cv_auc,
+            "test_roc_auc": metrics["models"][best_name]["test_roc_auc"],
             "model_path": best_model_path,
         }
         (RESULTS_DIR / "best_model.txt").write_text(best_model_path, encoding="utf-8")

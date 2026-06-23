@@ -16,7 +16,7 @@ export function ProcessingNode({ delay }: ProcessingNodeProps) {
         {/* Label */}
         <div className="mb-6">
           <h3 className="text-black mb-1">ML Model</h3>
-          <p className="text-gray-500">Neural network processing</p>
+          <p className="text-gray-500">Classifier inference</p>
         </div>
 
         {/* Loading animation */}
